@@ -2,7 +2,8 @@
 """
 fetch_and_push.py
 -----------------
-Fetches latest SBS battlefield stats, writes them into a local SQLite DB,
+Fetches latest SBS battlefield stats (overall daily/monthly and monthly per
+subdivision), writes them into a local SQLite DB,
 then uploads the updated DB directly to GitHub via the Contents API
 (no local clone of sbs-stats required).
 
@@ -51,25 +52,35 @@ KYIV_TZ = zoneinfo.ZoneInfo("Europe/Kyiv")
 DAILY_URL = "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68fa98652f31834f2e051459"
 YESTERDAY_URL = "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68b4852e792cdf918400daf1"
 
-MONTHLY_URLS: dict[str, str] = {
-    #"2025-06": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68e4e5d484f8ca462d9a7c77",
-    #"2025-07": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68e4e67684f8ca462d9a80db",
-    #"2025-08": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68b47e50792cdf918400b06c",
-    #"2025-09": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68b1c0f79d5ff32bdf80e705",
-    #"2025-10": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68dd1906de22367a4e908027",
-    #"2025-11": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/690531b56519eae72cea27b4",
-    #"2025-12": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/692cbeb9145504ee2b0171e5",
-    #"2026-01": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/69559d35869d2691543f313f",
-    #"2026-02": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/697e7bbb1ae0eb20ad9dbf56",
-    #"2026-03": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/69a365b5e9679075a2e69d57",
-    #"2026-04": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/69cc3630d5f5789a478b2f7b",
-    "2026-05": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/69f3c332bd3ea11e924505ca",
-    "2026-06": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68e4e5d484f8ca462d9a7c77",
-    "2026-07": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68e4e67684f8ca462d9a80db",
-    "2026-08": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68b47e50792cdf918400b06c",
-    "2026-09": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68b1c0f79d5ff32bdf80e705",
-    "2026-10": "https://sbs-group.army/api/public/statistics/68b0c85589944c4bfb2a5edc/68dd1906de22367a4e908027",
+SBS_API = "https://sbs-group.army/api/public"
+
+# Monthly period urls are discovered via the API (see get_monthly_periods()).
+# Division 0 is the whole USF grouping (monthly_stats).
+OVERALL_DIVISION_ID = 0
+
+# Subdivision slug (as on sbs-group.army/en/subdivision/<slug>) → division ids.
+# cusd_stss is shown on the website as the sum of divisions 14 and 15.
+SUBDIVISIONS: dict[str, list[int]] = {
+    "magyars_birds":    [1],
+    "nemesis":          [2],
+    "phoenix":          [3],
+    "steppe_predators": [4],
+    "rarog":            [5],
+    "achilles":         [6],
+    "k_2":              [7],
+    "raid":             [8],
+    "svarog":           [10],
+    "9_susbr":          [12],
+    "hawks":            [13],
+    "cusd_stss":        [14, 15],
 }
+MONTHLY_START_MONTH = "2025-11"
+# Number of recent months (incl. the current one) refetched on every run.
+# Older months don't change anymore and are only fetched once if missing in the DB.
+MONTHLY_REFRESH_MONTHS = 2
+# Minimum pause between two SBS requests (the API answers bursts with HTTP 429)
+REQUEST_DELAY = 1.0
+SUBDIVISION_REQUEST_DELAY = 2.0
 
 SBS_HEADERS = {
     "User-Agent": (
@@ -110,9 +121,20 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (date)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subdivision_monthly_stats (
+            date DATE, subdivision TEXT,
+            data_collected_at TEXT, last_updated DATETIME,
+            personnel_killed INTEGER, personnel_wounded INTEGER,
+            total_targets_hit INTEGER, total_targets_destroyed INTEGER,
+            total_personnel_casualties INTEGER,
+            flights_strike INTEGER, flights_recon INTEGER,
+            PRIMARY KEY (date, subdivision)
+        )
+    """)
     conn.commit()
     # Migrate existing DBs created before the flights columns were added
-    for table in ("daily_stats", "monthly_stats"):
+    for table in ("daily_stats", "monthly_stats", "subdivision_monthly_stats"):
         add_missing_columns(conn, table, ["flights_strike", "flights_recon"])
 
 
@@ -131,20 +153,37 @@ def ensure_columns(conn: sqlite3.Connection, table: str, tids: list[int]) -> Non
 
 # ─── SBS HTTP fetch with retries ──────────────────────────────────────────────
 
-def fetch_json(url: str, retries: int = 5, backoff: int = 5) -> dict:
-    session = requests.Session()
-    session.headers.update(SBS_HEADERS)
+_session = requests.Session()
+_session.headers.update(SBS_HEADERS)
+_last_request = 0.0
+
+
+def _retry_delay(r: requests.Response, attempt: int, backoff: int) -> float:
+    retry_after = r.headers.get("Retry-After", "")
+    if retry_after.isdigit():
+        return int(retry_after)
+    # Rate limiting needs a longer pause than transient server errors
+    return (15 if r.status_code == 429 else backoff) * attempt
+
+
+def fetch_json(url: str, retries: int = 5, backoff: int = 5, delay: float = REQUEST_DELAY) -> dict:
+    global _last_request
     for attempt in range(1, retries + 1):
+        wait = delay - (time.monotonic() - _last_request)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request = time.monotonic()
         ts = datetime.now().strftime("[%d.%m.%Y %H:%M:%S]")
         try:
-            r = session.get(url, timeout=15)
+            r = _session.get(url, timeout=15)
             r.raise_for_status()
             return r.json()
         except requests.exceptions.HTTPError as e:
-            if "525" in str(e):
-                print(f"⚠️  {ts} HTTP 525. Attempt {attempt}/{retries}...")
+            status = e.response.status_code
+            if status == 429 or status >= 500:
+                print(f"⚠️  {ts} HTTP {status}. Attempt {attempt}/{retries}...")
                 if attempt < retries:
-                    time.sleep(backoff * attempt)
+                    time.sleep(_retry_delay(e.response, attempt, backoff))
                     continue
             raise
         except requests.exceptions.RequestException as e:
@@ -186,6 +225,53 @@ def parse_response(raw: dict) -> dict:
 def to_kyiv(iso_str: str) -> datetime:
     return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(KYIV_TZ)
 
+# ─── Monthly periods / subdivisions ───────────────────────────────────────────
+
+def get_monthly_periods(division_id: int, delay: float = REQUEST_DELAY) -> dict[str, str]:
+    """Return {"YYYY-MM": stats_url} for a division's monthly periods.
+    Period ids are reused every year, but startDate always reflects the month
+    the period currently holds."""
+    sub = fetch_json(f"{SBS_API}/subdivisions/by-division-id/{division_id}", delay=delay)["data"]["subdivision"]
+    periods: dict[str, str] = {}
+    for p in sub.get("periods", []):
+        if not p.get("periodType", "").startswith("monthly_") or not p.get("startDate"):
+            continue
+        month = to_kyiv(p["startDate"]).strftime("%Y-%m")
+        if month >= MONTHLY_START_MONTH:
+            periods[month] = f"{SBS_API}/statistics/{sub['_id']}/{p['id']}"
+    return periods
+
+
+_SUM_FIELDS = (
+    "personnel_killed", "personnel_wounded",
+    "total_targets_hit", "total_targets_destroyed", "total_personnel_casualties",
+    "flights_strike", "flights_recon",
+)
+
+
+def sum_parsed(parts: list[dict]) -> dict:
+    """Combine parsed responses of several divisions (e.g. cusd_stss = 14 + 15)."""
+    if len(parts) == 1:
+        return parts[0]
+
+    def add(values):
+        values = [v for v in values if v is not None]
+        return sum(int(v) for v in values) if values else None
+
+    out = {
+        "data_collected_at": max((p["data_collected_at"] or "" for p in parts), default=None) or None,
+        "start_date":        parts[0]["start_date"],
+        "last_updated":      None,
+    }
+    for f in _SUM_FIELDS:
+        out[f] = add(p[f] for p in parts)
+    tids = {tid for p in parts for tid in p["targets"]}
+    out["targets"] = {
+        tid: {k: add(p["targets"].get(tid, {}).get(k) for p in parts) for k in ("hit", "destroyed")}
+        for tid in tids
+    }
+    return out
+
 # ─── Upsert ───────────────────────────────────────────────────────────────────
 
 def _upsert(conn: sqlite3.Connection, table: str, pk_cols: list[str], data: dict) -> None:
@@ -223,6 +309,13 @@ def upsert_monthly(conn: sqlite3.Connection, data: dict) -> None:
     del data["start_date"] # remove field
     _upsert(conn, "monthly_stats", ["date"], data)
     print(f"  ✅ monthly_stats: {date}")
+
+
+def upsert_subdivision_monthly(conn: sqlite3.Connection, data: dict) -> None:
+    date, sub = data["date"], data["subdivision"]
+    del data["start_date"] # remove field
+    _upsert(conn, "subdivision_monthly_stats", ["date", "subdivision"], data)
+    print(f"  ✅ subdivision_monthly_stats: {sub} {date}")
 
 # ─── GitHub Contents API push ─────────────────────────────────────────────────
 
@@ -310,8 +403,22 @@ def main() -> None:
     p["hour"] = 23
     upsert_daily(conn, p)
 
-    # Monthly
-    for month, url in MONTHLY_URLS.items():
+    # Monthly — refresh the last MONTHLY_REFRESH_MONTHS months,
+    # older months are only fetched once (backfill)
+    now = datetime.now(KYIV_TZ)
+    y, m = divmod(now.year * 12 + now.month - 1 - (MONTHLY_REFRESH_MONTHS - 1), 12)
+    refresh_from = f"{y}-{m + 1:02d}"
+
+    print("Fetching monthly periods...")
+    try:
+        periods = get_monthly_periods(OVERALL_DIVISION_ID)
+    except Exception as e:
+        print(f"  ⚠️  Skipping monthly: {e}")
+        periods = {}
+    existing = {row[0][:7] for row in conn.execute("SELECT date FROM monthly_stats")}
+    for month, url in sorted(periods.items()):
+        if month < refresh_from and month in existing:
+            continue
         print(f"Fetching monthly {month}...")
         try:
             pm = parse_response(fetch_json(url))
@@ -319,6 +426,35 @@ def main() -> None:
             upsert_monthly(conn, pm)
         except Exception as e:
             print(f"  ⚠️  Skipping {month}: {e}")
+
+    # Monthly per subdivision (slower request rate — many requests per run)
+    for slug, division_ids in SUBDIVISIONS.items():
+        print(f"Fetching subdivision {slug}...")
+        try:
+            periods = [get_monthly_periods(d, SUBDIVISION_REQUEST_DELAY) for d in division_ids]
+        except Exception as e:
+            print(f"  ⚠️  Skipping {slug}: {e}")
+            continue
+        existing = {
+            row[0][:7] for row in conn.execute(
+                "SELECT date FROM subdivision_monthly_stats WHERE subdivision = ?", (slug,)
+            )
+        }
+        months = sorted(set().union(*periods))
+        for month in months:
+            if month < refresh_from and month in existing:
+                continue
+            try:
+                parts = [
+                    parse_response(fetch_json(p[month], delay=SUBDIVISION_REQUEST_DELAY))
+                    for p in periods if month in p
+                ]
+                pm = sum_parsed(parts)
+                pm["date"] = f"{month}-01"
+                pm["subdivision"] = slug
+                upsert_subdivision_monthly(conn, pm)
+            except Exception as e:
+                print(f"  ⚠️  Skipping {slug} {month}: {e}")
 
     # Checkpoint WAL and close — ensures all data is flushed to the DB file
     # before we read the bytes and push to GitHub
