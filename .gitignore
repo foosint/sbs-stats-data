@@ -1,4 +1,4 @@
-sbs.db
+/sbs.db
 cron.log
 .venv/
 __pycache__/

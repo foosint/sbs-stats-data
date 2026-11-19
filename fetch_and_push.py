@@ -3,20 +3,19 @@
 fetch_and_push.py
 -----------------
 Fetches latest SBS battlefield stats (overall daily/monthly and monthly per
-subdivision), writes them into a local SQLite DB,
-then uploads the updated DB directly to GitHub via the Contents API
-(no local clone of sbs-stats required).
+subdivision), writes them into data/sbs.db in this repo, then commits the
+DB and pushes it over SSH with the repo's deploy key (only with PUBLISH=1,
+which is set on the Pi only).
 
 Run via cron every 10 minutes:
-    */10 * * * * cd /home/pi/sbs-fetcher && uv run fetch_and_push.py >> cron.log 2>&1
+    */10 * * * * cd /home/pi/sbs-stats-data && uv run fetch_and_push.py >> cron.log 2>&1
 
 Configuration via .env (see .env.example).
 """
 
-import base64
-import hashlib
 import os
 import sqlite3
+import subprocess
 import time
 import zoneinfo
 from datetime import datetime, timezone
@@ -36,14 +35,11 @@ if _env_path.exists():
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-DB_PATH       = os.environ.get("SBS_DB_PATH",    str(Path(__file__).parent / "sbs.db"))
-GITHUB_TOKEN  = os.environ["GITHUB_TOKEN"]          # required — fail fast if missing
-GITHUB_REPO   = os.environ["GITHUB_REPO"]           # e.g. "yourname/sbs-stats"
-GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH",  "main")
-GITHUB_DB_PATH= os.environ.get("GITHUB_DB_PATH", "data/sbs.db")
-GIT_NAME      = os.environ.get("GIT_USER_NAME",  "sbs-fetcher")
-GIT_EMAIL     = os.environ.get("GIT_USER_EMAIL", "")
-# Note: GIT_SIGN_KEY is not used — see comment in push_db_to_github()
+HERE    = Path(__file__).parent
+DB_PATH = os.environ.get("SBS_DB_PATH", str(HERE / "data" / "sbs.db"))
+# Commit and push the DB after each run. Set PUBLISH=1 only on the Pi,
+# so that one machine writes the data.
+PUBLISH = os.environ.get("PUBLISH") == "1"
 
 KYIV_TZ = zoneinfo.ZoneInfo("Europe/Kyiv")
 
@@ -322,64 +318,49 @@ def upsert_subdivision_monthly(conn: sqlite3.Connection, data: dict) -> None:
     _upsert(conn, "subdivision_monthly_stats", ["date", "subdivision"], data)
     log(f"  ✅ subdivision_monthly_stats: {sub} {date}")
 
-# ─── GitHub Contents API push ─────────────────────────────────────────────────
+# ─── Publish via git (deploy key) ─────────────────────────────────────────────
 
-def push_db_to_github() -> None:
+def git(*args: str) -> str:
+    r = subprocess.run(["git", "-C", str(HERE), *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode:
+        raise RuntimeError(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def publish() -> None:
     """
-    Upload DB to GitHub via the Contents API.
-    Uses PUT /repos/{owner}/{repo}/contents/{path}
-    If the file already exists, fetches its SHA first (required for updates).
-    Optionally creates a GPG-signed commit if GIT_SIGN_KEY is set.
+    Commit the DB in this repo if it changed, and push if the clone is ahead of origin.
+    Pushes over SSH with the repo's deploy key (PUBLISH_SSH_KEY).
+    Runs on every invocation, so a push that failed earlier (no network) is retried
+    on the next run even when nothing new changed.
     """
-    db_bytes = Path(DB_PATH).read_bytes()
-    new_sha   = hashlib.sha256(db_bytes).hexdigest()
+    if key := os.environ.get("PUBLISH_SSH_KEY"):
+        os.environ["GIT_SSH_COMMAND"] = (
+            f'ssh -i "{Path(key).expanduser()}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new')
+    # Bot identity — keeps the data commits off any personal GitHub profile
+    name = os.environ.get("PUBLISH_GIT_NAME", "sbs-stats-data")
+    email = os.environ.get("PUBLISH_GIT_EMAIL", "sbs-stats-data@bot.invalid")
+    for var in ("AUTHOR", "COMMITTER"):
+        os.environ.setdefault(f"GIT_{var}_NAME", name)
+        os.environ.setdefault(f"GIT_{var}_EMAIL", email)
 
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DB_PATH}"
-    gh_headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    # Get current file SHA (needed to update an existing file)
-    file_sha: str | None = None
-    r = requests.get(
-        api_url,
-        headers=gh_headers,
-        params={"ref": GITHUB_BRANCH},
-        timeout=15,
-    )
-    if r.status_code == 200:
-        file_sha = r.json().get("sha")
-        # Compare content hash to avoid unnecessary pushes
-        remote_content = base64.b64decode(r.json().get("content", ""))
-        if hashlib.sha256(remote_content).hexdigest() == new_sha:
-            log("  ℹ️  sbs.db unchanged, skipping push.")
-            return
-    elif r.status_code != 404:
-        r.raise_for_status()
-
-    # Build commit payload
+    db = str(Path(DB_PATH).resolve())
     ts = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-    payload: dict = {
-        "message": f"chore: update sbs.db [skip ci]\n\nFetched at {ts}",
-        "content": base64.b64encode(db_bytes).decode(),
-        "branch":  GITHUB_BRANCH,
-        "committer": {"name": GIT_NAME, "email": GIT_EMAIL},
-        "author":    {"name": GIT_NAME, "email": GIT_EMAIL},
-    }
-    if file_sha:
-        payload["sha"] = file_sha
-
-    # Note: the GitHub Contents API does not support SSH commit signing —
-    # the "signature" field only accepts GPG armored signatures, and SSH-format
-    # signing is only honoured by git itself (not the REST API).
-    # Commits pushed via this API will show as "Unverified" on GitHub.
-    # This is a GitHub API limitation, not a bug in this script.
-
-    r = requests.put(api_url, headers=gh_headers, json=payload, timeout=30)
-    r.raise_for_status()
-    log(f"  ✅ Pushed sbs.db to GitHub ({GITHUB_REPO} @ {GITHUB_BRANCH})")
+    try:
+        if git("status", "--porcelain", "--", db):
+            git("add", "--", db)
+            # DB only, never other local edits
+            git("commit", "--quiet", "-m", f"chore: update sbs.db [skip ci]\n\nFetched at {ts}", "--", db)
+            log("  ✅ Committed sbs.db")
+        else:
+            log("  ℹ️  sbs.db unchanged, nothing to commit.")
+        if int(git("rev-list", "--count", "@{u}..HEAD")):
+            git("pull", "--rebase", "--autostash", "--quiet")  # pick up code commits from elsewhere
+            git("push", "--quiet")
+            log("  ✅ Pushed to origin")
+    except RuntimeError as e:
+        log(f"  ⚠️  Publish failed, will retry next run: {e}")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -462,13 +443,15 @@ def main() -> None:
                 log(f"  ⚠️  Skipping {slug} {month}: {e}")
 
     # Checkpoint WAL and close — ensures all data is flushed to the DB file
-    # before we read the bytes and push to GitHub
+    # before we commit it
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
 
-    # Push to GitHub
-    log("Pushing to GitHub...")
-    push_db_to_github()
+    if PUBLISH:
+        log("Publishing...")
+        publish()
+    else:
+        log("Publishing disabled (PUBLISH != 1), not committing.")
 
     log("Done.")
 

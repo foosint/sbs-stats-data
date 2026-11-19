@@ -11,7 +11,7 @@ before pushing your repo to GitHub.
 import os
 import sqlite3
 
-DB_PATH = os.environ.get("DB_PATH", "./sbs.db")
+DB_PATH = os.environ.get("DB_PATH", "./data/sbs.db")
 TARGET_IDS = [1, 2, 5, 7, 18, 21, 22, 25]
 
 
