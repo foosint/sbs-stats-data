@@ -96,6 +96,12 @@ SBS_HEADERS = {
     "Sec-Fetch-Dest": "empty",
 }
 
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
 # ─── Schema ───────────────────────────────────────────────────────────────────
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -173,7 +179,6 @@ def fetch_json(url: str, retries: int = 5, backoff: int = 5, delay: float = REQU
         if wait > 0:
             time.sleep(wait)
         _last_request = time.monotonic()
-        ts = datetime.now().strftime("[%d.%m.%Y %H:%M:%S]")
         try:
             r = _session.get(url, timeout=15)
             r.raise_for_status()
@@ -181,13 +186,13 @@ def fetch_json(url: str, retries: int = 5, backoff: int = 5, delay: float = REQU
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code
             if status == 429 or status >= 500:
-                print(f"⚠️  {ts} HTTP {status}. Attempt {attempt}/{retries}...")
+                log(f"⚠️  HTTP {status}. Attempt {attempt}/{retries}...")
                 if attempt < retries:
                     time.sleep(_retry_delay(e.response, attempt, backoff))
                     continue
             raise
         except requests.exceptions.RequestException as e:
-            print(f"⚠️  {ts} Network error: {e}. Attempt {attempt}/{retries}...")
+            log(f"⚠️  Network error: {e}. Attempt {attempt}/{retries}...")
             if attempt < retries:
                 time.sleep(backoff * attempt)
                 continue
@@ -301,21 +306,21 @@ def upsert_daily(conn: sqlite3.Connection, data: dict) -> None:
     date, hour = data["date"], data["hour"]
     del data["start_date"] # remove field
     _upsert(conn, "daily_stats", ["date", "hour"], data)
-    print(f"  ✅ daily_stats:   {date} hour {hour:02d}")
+    log(f"  ✅ daily_stats:   {date} hour {hour:02d}")
 
 
 def upsert_monthly(conn: sqlite3.Connection, data: dict) -> None:
     date = data["date"]
     del data["start_date"] # remove field
     _upsert(conn, "monthly_stats", ["date"], data)
-    print(f"  ✅ monthly_stats: {date}")
+    log(f"  ✅ monthly_stats: {date}")
 
 
 def upsert_subdivision_monthly(conn: sqlite3.Connection, data: dict) -> None:
     date, sub = data["date"], data["subdivision"]
     del data["start_date"] # remove field
     _upsert(conn, "subdivision_monthly_stats", ["date", "subdivision"], data)
-    print(f"  ✅ subdivision_monthly_stats: {sub} {date}")
+    log(f"  ✅ subdivision_monthly_stats: {sub} {date}")
 
 # ─── GitHub Contents API push ─────────────────────────────────────────────────
 
@@ -349,7 +354,7 @@ def push_db_to_github() -> None:
         # Compare content hash to avoid unnecessary pushes
         remote_content = base64.b64decode(r.json().get("content", ""))
         if hashlib.sha256(remote_content).hexdigest() == new_sha:
-            print("  ℹ️  sbs.db unchanged, skipping push.")
+            log("  ℹ️  sbs.db unchanged, skipping push.")
             return
     elif r.status_code != 404:
         r.raise_for_status()
@@ -374,13 +379,13 @@ def push_db_to_github() -> None:
 
     r = requests.put(api_url, headers=gh_headers, json=payload, timeout=30)
     r.raise_for_status()
-    print(f"  ✅ Pushed sbs.db to GitHub ({GITHUB_REPO} @ {GITHUB_BRANCH})")
+    log(f"  ✅ Pushed sbs.db to GitHub ({GITHUB_REPO} @ {GITHUB_BRANCH})")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    print(f"\n[{ts}] Starting fetch...")
+    print()
+    log("Starting fetch...")
 
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -388,7 +393,7 @@ def main() -> None:
     ensure_schema(conn)
 
     # Daily
-    print("Fetching daily...")
+    log("Fetching daily...")
     p = parse_response(fetch_json(DAILY_URL))
     kyiv_dt   = to_kyiv(p["data_collected_at"])
     p["date"] = kyiv_dt.strftime("%Y-%m-%d")
@@ -396,7 +401,7 @@ def main() -> None:
     upsert_daily(conn, p)
 
     # Yesterday (add the adjusted value to the last hour of the previous day)
-    print("Fetching yesterday...")
+    log("Fetching yesterday...")
     p = parse_response(fetch_json(YESTERDAY_URL))
     kyiv_dt = datetime.fromisoformat(p["start_date"])
     p["date"] = kyiv_dt.strftime("%Y-%m-%d")
@@ -409,31 +414,31 @@ def main() -> None:
     y, m = divmod(now.year * 12 + now.month - 1 - (MONTHLY_REFRESH_MONTHS - 1), 12)
     refresh_from = f"{y}-{m + 1:02d}"
 
-    print("Fetching monthly periods...")
+    log("Fetching monthly periods...")
     try:
         periods = get_monthly_periods(OVERALL_DIVISION_ID)
     except Exception as e:
-        print(f"  ⚠️  Skipping monthly: {e}")
+        log(f"  ⚠️  Skipping monthly: {e}")
         periods = {}
     existing = {row[0][:7] for row in conn.execute("SELECT date FROM monthly_stats")}
     for month, url in sorted(periods.items()):
         if month < refresh_from and month in existing:
             continue
-        print(f"Fetching monthly {month}...")
+        log(f"Fetching monthly {month}...")
         try:
             pm = parse_response(fetch_json(url))
             pm["date"] = f"{month}-01"
             upsert_monthly(conn, pm)
         except Exception as e:
-            print(f"  ⚠️  Skipping {month}: {e}")
+            log(f"  ⚠️  Skipping {month}: {e}")
 
     # Monthly per subdivision (slower request rate — many requests per run)
     for slug, division_ids in SUBDIVISIONS.items():
-        print(f"Fetching subdivision {slug}...")
+        log(f"Fetching subdivision {slug}...")
         try:
             periods = [get_monthly_periods(d, SUBDIVISION_REQUEST_DELAY) for d in division_ids]
         except Exception as e:
-            print(f"  ⚠️  Skipping {slug}: {e}")
+            log(f"  ⚠️  Skipping {slug}: {e}")
             continue
         existing = {
             row[0][:7] for row in conn.execute(
@@ -454,7 +459,7 @@ def main() -> None:
                 pm["subdivision"] = slug
                 upsert_subdivision_monthly(conn, pm)
             except Exception as e:
-                print(f"  ⚠️  Skipping {slug} {month}: {e}")
+                log(f"  ⚠️  Skipping {slug} {month}: {e}")
 
     # Checkpoint WAL and close — ensures all data is flushed to the DB file
     # before we read the bytes and push to GitHub
@@ -462,10 +467,10 @@ def main() -> None:
     conn.close()
 
     # Push to GitHub
-    print("Pushing to GitHub...")
+    log("Pushing to GitHub...")
     push_db_to_github()
 
-    print("Done.")
+    log("Done.")
 
 
 if __name__ == "__main__":
